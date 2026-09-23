@@ -12,8 +12,8 @@ import subprocess
 import time
 import httpx
 from datetime import datetime
-from hermes_cli.profile_input import DomainProfile
-from hermes_cli.hermes_orchestrator import get_orchestrator
+from profile_input import DomainProfile
+from hermes_orchestrator import get_orchestrator
 
 
 async def wait_for_service(url: str, timeout: int = 10) -> bool:

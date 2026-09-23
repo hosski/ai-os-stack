@@ -7,8 +7,8 @@ Starts interactive domain profile input and task dispatch.
 
 from typing import Optional
 import asyncio
-from hermes_cli.profile_input import prompt_for_domain_profile
-from hermes_cli.hermes_orchestrator import get_orchestrator
+from profile_input import prompt_for_domain_profile
+from hermes_orchestrator import get_orchestrator
 
 
 async def handle_profile_setup_command() -> str:

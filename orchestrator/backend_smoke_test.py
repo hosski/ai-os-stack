@@ -12,14 +12,14 @@ Verifies:
 import asyncio
 from datetime import datetime
 
-from hermes_cli.profile_input import DomainProfile
-from hermes_cli.hermes_orchestrator import get_orchestrator
-from hermes_cli.mcp_plugin_endpoints import (
+from profile_input import DomainProfile
+from hermes_orchestrator import get_orchestrator
+from mcp_plugin_endpoints import (
     PluginRegistry,
     PluginConfig,
     PluginType,
 )
-from hermes_cli.fruvisi_qa_service import _get_required_fields_for_domain
+from fruvisi_qa_service import _get_required_fields_for_domain
 
 
 def test_profile_input():

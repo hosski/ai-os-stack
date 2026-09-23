@@ -105,7 +105,7 @@ def save_domain_profile(profile: DomainProfile, config_path: Optional[Path] = No
     if config_path is None:
         config_path = Path.home() / ".hermes" / "config.yaml"
     
-    # TODO: Integrate with atomic_config_write from hermes_cli.config
+    # TODO: Integrate with atomic_config_write from config
     # For now, just log what would be saved
     print(f"\n✓ Profile saved: {profile['domain']} ({profile['primary_model']})")
     print(f"  Description: {profile['description']}")

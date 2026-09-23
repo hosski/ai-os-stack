@@ -19,15 +19,15 @@ from datetime import datetime
 import uuid
 import logging
 
-from hermes_cli.profile_input import DomainProfile
-from hermes_cli.hermes_openviking_api import (
+from profile_input import DomainProfile
+from hermes_openviking_api import (
     TaskObject,
     store_task_state,
     fetch_task_state,
     store_qa_result,
     QAResult,
 )
-from hermes_cli.mcp_plugin_endpoints import (
+from mcp_plugin_endpoints import (
     get_plugin_registry,
     PluginType,
 )
