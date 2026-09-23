@@ -89,6 +89,41 @@ class FruvisiTeamRegistry:
         return members
 
 
+class TaskDAG:
+    """Represents a task Directed Acyclic Graph with dependencies and parallelization hints."""
+    
+    def __init__(self, dag_dict: Dict[str, Any]):
+        self.domain = dag_dict.get("domain")
+        self.timeline = dag_dict.get("timeline")
+        self.success_criteria = dag_dict.get("successCriteria")
+        self.tasks = dag_dict.get("tasks", [])  # List of {id, name, duration, dependsOn, owner, ...}
+        self.parallelization = dag_dict.get("parallelization", {})
+    
+    def get_task_layers(self) -> List[List[Dict[str, Any]]]:
+        """Compute topological layers: tier 0 (no deps), tier 1 (deps on tier 0), etc."""
+        processed = set()
+        layers = []
+        
+        while processed != set(t["id"] for t in self.tasks):
+            current_layer = [
+                t for t in self.tasks
+                if t["id"] not in processed
+                and all(dep in processed for dep in t.get("dependsOn", []))
+            ]
+            
+            if not current_layer:
+                break  # Cycle detected
+            
+            layers.append(current_layer)
+            processed.update(t["id"] for t in current_layer)
+        
+        return layers
+    
+    def can_parallelize_task(self, task_id: str) -> bool:
+        """Check if a task can run in parallel (is in parallelization hints)."""
+        return task_id in self.parallelization.get("canRunTogether", [])
+
+
 class TeamDispatcher:
     """Dispatches tasks to team Chiefs of Staff."""
     
@@ -146,3 +181,63 @@ async def dispatch_to_team_chief(
 ) -> Dict[str, Any]:
     dispatcher = get_team_dispatcher()
     return await dispatcher.dispatch_to_team(domain, task_type, task_payload)
+
+
+async def dispatch_task_dag(
+    task_dag: TaskDAG,
+    parallelization_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Dispatch a task DAG to the appropriate team Chief.
+    
+    The Chief will:
+    1. Read the task DAG layers (topological sort)
+    2. For each tier:
+       - Spawn sub-agents for parallel tasks (if enabled)
+       - Wait for all to complete
+    3. Move to next tier (which depends on prior tier completion)
+    4. Return aggregated results
+    """
+    dispatcher = get_team_dispatcher()
+    
+    if not task_dag.domain:
+        raise ValueError("Task DAG must have a domain")
+    
+    chief = dispatcher.registry.get_chief_agent(task_dag.domain)
+    
+    if not chief:
+        raise RuntimeError(f"No Chief of Staff found for domain {task_dag.domain}")
+    
+    layers = task_dag.get_task_layers()
+    members = dispatcher.registry.get_team_members(task_dag.domain)
+    
+    config = parallelization_config or {
+        "p_cores": 8,
+        "e_cores": 4,
+        "qos_hint": "utility",
+        "enable_parallelization": True,
+    }
+    
+    dispatch = {
+        "domain": task_dag.domain,
+        "task_id": task_dag.tasks[0]["id"] if task_dag.tasks else "unknown",
+        "task_dag": {
+            "timeline": task_dag.timeline,
+            "success_criteria": task_dag.success_criteria,
+            "tasks": task_dag.tasks,
+            "layers": layers,
+            "parallelization": task_dag.parallelization,
+        },
+        "chief_of_staff": chief,
+        "team_members": members,
+        "config": config,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "execution_strategy": "tier-by-tier with parallelization where enabled",
+    }
+    
+    logger.info(
+        f"Dispatching task DAG to Chief {chief['agent_id']}: "
+        f"{len(layers)} tiers, {len(task_dag.tasks)} tasks, "
+        f"{len(task_dag.parallelization.get('canRunTogether', []))} parallel opportunities"
+    )
+    return dispatch
