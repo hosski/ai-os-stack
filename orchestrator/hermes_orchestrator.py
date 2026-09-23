@@ -1,23 +1,24 @@
 """
-Hermes Backend Orchestrator: Core routing and task dispatch for AI OS Stack.
+Hermes Backend Orchestrator v2: Executor-driven parallel dispatch.
 
-Responsibilities:
-  1. Accept domain profiles from CLI
-  2. Dispatch tasks to plugins (GraphCode, Executor, Open Design) via MCP
-  3. Communicate with OpenViking for state management
-  4. Route QA results from Fruvisi and trigger rework loops
-  5. Coordinate parallel agent execution
+Executor (port 8004) is the parallel agent engine:
+  - Spawns independent workers per domain (Video, Law, Architecture, Homesteading)
+  - All agents run in parallel, not sequentially
+  - Each agent: task execution → Fruvisi QA → rework loops
+  - Results flow back through OpenViking
 
-Entry points:
-  - HermesOrchestrator.dispatch_task()
-  - HermesOrchestrator.process_qa_verdict()
+Flow:
+  /profile-setup → orchestration_cli_command.py → dispatch_parallel_tasks()
+    → Executor (JSON-RPC) spawns 4 domain agents in parallel
+    → Each agent processes independently
+    → Fruvisi QA validates results
+    → Rework or escalation as needed
 """
 
-from typing import Optional, Any, Union, Dict
+from typing import Optional, Any, List, Dict
 import asyncio
 from datetime import datetime
-import uuid
-import logging
+import httpx
 
 from profile_input import DomainProfile
 from hermes_openviking_api import (
@@ -27,42 +28,45 @@ from hermes_openviking_api import (
     store_qa_result,
     QAResult,
 )
-from mcp_plugin_endpoints import (
-    get_plugin_registry,
-    PluginType,
-)
 
-logger = logging.getLogger(__name__)
+# Executor is the parallel dispatch engine
+EXECUTOR_PORT = 8004
+EXECUTOR_BASE = f"http://localhost:{EXECUTOR_PORT}"
+
+# Domain → primary model mapping
+DOMAIN_MODELS = {
+    "video": "ltx-2.5",
+    "law": "qwen-3.8",
+    "architecture": "claude-opus",
+    "homesteading": "llama-2",
+}
 
 
-class HermesOrchestrator:
-    """Core orchestrator for AI OS Stack backend."""
+class ExecutorOrchestrator:
+    """Routes tasks to Executor for parallel agent dispatch."""
     
     def __init__(self):
-        self.plugin_registry = get_plugin_registry()
+        self.client = httpx.AsyncClient(base_url=EXECUTOR_BASE, timeout=30.0)
         self.active_tasks: Dict[str, TaskObject] = {}
     
     async def dispatch_task(
         self,
         domain_profile: DomainProfile,
-        task_type: str,  # e.g., "generate", "analyze", "refactor"
-        input_payload: dict[str, Any],
+        task_type: str,
+        input_payload: Dict[str, Any],
     ) -> str:
-        """
-        Dispatch a task through the orchestration pipeline.
+        """Dispatch single task to Executor.
         
         Args:
-            domain_profile: Domain configuration (video, law, etc.)
-            task_type: Type of task to perform
-            input_payload: Input data for the task
+            domain_profile: Domain configuration
+            task_type: "generate", "analyze", "design", "synthesize"
+            input_payload: Task input data
         
         Returns:
-            Task ID for tracking
+            task_id from Executor
         """
-        task_id = str(uuid.uuid4())
-        now = datetime.utcnow().isoformat() + "Z"
+        task_id = f"task_{datetime.utcnow().isoformat()}"
         
-        # Create task object
         task: TaskObject = {
             "task_id": task_id,
             "status": "pending",
@@ -70,54 +74,107 @@ class HermesOrchestrator:
             "retry_count": 0,
             "priority": 1,
             "domain_profile": domain_profile["domain"],
-            "created_at": now,
+            "created_at": datetime.utcnow().isoformat() + "Z",
         }
         
         # Store in OpenViking
         await store_task_state(task)
         self.active_tasks[task_id] = task
         
-        logger.info(f"Dispatched task {task_id} for domain {domain_profile['domain']}")
+        # Send to Executor via JSON-RPC
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "id": task_id,
+            "method": "executor.dispatch",
+            "params": [{
+                "task_id": task_id,
+                "domain": domain_profile["domain"],
+                "task_type": task_type,
+                "input_payload": input_payload,
+                "models": {
+                    "primary": domain_profile["primary_model"],
+                    "aux": domain_profile["aux_models"],
+                },
+            }]
+        }
         
-        # Route to appropriate plugin based on task_type and domain
-        plugin_target = self._route_to_plugin(task_type, domain_profile["domain"])
-        if plugin_target:
-            await self._invoke_plugin(
-                task_id,
-                plugin_target,
-                task_type,
-                input_payload,
-                domain_profile,
-            )
+        try:
+            response = await self.client.post("/rpc", json=rpc_payload)
+            result = response.json()
+            
+            if "result" in result:
+                return task_id
+            else:
+                raise RuntimeError(f"Executor error: {result.get('error', 'unknown')}")
         
-        return task_id
+        except Exception as e:
+            raise RuntimeError(f"Failed to dispatch to Executor: {e}")
     
-    async def process_qa_verdict(self, task_id: str, verdict: dict[str, Any]) -> None:
+    async def dispatch_parallel_tasks(
+        self,
+        profiles: List[DomainProfile],
+        task_specs: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Dispatch multiple domain tasks in parallel.
+        
+        PARALLEL EXECUTION: All domains run simultaneously via Executor.
+        
+        Args:
+            profiles: List of domain profiles
+            task_specs: List of task specs (task_type, input_payload)
+        
+        Returns:
+            List of task_ids (all dispatched in parallel)
         """
-        Process QA verdict from Fruvisi and handle routing.
+        tasks = [
+            self.dispatch_task(profile, spec["task_type"], spec["input_payload"])
+            for profile, spec in zip(profiles, task_specs)
+        ]
+        
+        # All tasks dispatched to Executor in parallel
+        return await asyncio.gather(*tasks)
+    
+    async def check_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Poll Executor for task status."""
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "id": task_id,
+            "method": "executor.status",
+            "params": [task_id]
+        }
+        
+        try:
+            response = await self.client.post("/rpc", json=rpc_payload)
+            return response.json().get("result")
+        except Exception:
+            return None
+    
+    async def process_qa_verdict(self, task_id: str, verdict: Dict[str, Any]) -> None:
+        """Process QA verdict from Fruvisi.
         
         Logic:
           - If passed: mark complete
-          - If failed & retries < max: rework (re-dispatch)
-          - If failed & retries >= max: escalate (human review)
+          - If failed & retries < 3: rework (dispatch again)
+          - If failed & retries >= 3: escalate (human review)
         """
         task = await fetch_task_state(task_id)
         if not task:
-            logger.error(f"Task {task_id} not found")
             return
         
         if verdict["passed"]:
             task["status"] = "completed"
-            logger.info(f"Task {task_id} passed QA")
         else:
-            next_action = verdict.get("next_action")
-            if next_action == "rework":
+            if task["retry_count"] < 3:
                 task["status"] = "pending"
                 task["retry_count"] += 1
-                logger.info(f"Task {task_id} rework scheduled (retry {task['retry_count']})")
-            elif next_action == "escalate":
+                # Re-dispatch to Executor
+                await self.dispatch_task(
+                    {"domain": task["domain_profile"], "primary_model": "default", "aux_models": []},
+                    "rework",
+                    verdict.get("feedback", {}),
+                )
+            else:
                 task["status"] = "failed"
-                logger.warning(f"Task {task_id} escalated for human review")
         
         # Store updated task
         await store_task_state(task)
@@ -130,78 +187,15 @@ class HermesOrchestrator:
             "checked_at": datetime.utcnow().isoformat() + "Z",
         }
         await store_qa_result(qa_result)
-    
-    def _route_to_plugin(self, task_type: str, domain: str) -> Optional[PluginType]:
-        """
-        Route task to appropriate plugin based on type and domain.
-        
-        Examples:
-          - task_type="generate", domain="video" -> EXECUTOR
-          - task_type="analyze", domain="law" -> GRAPHCODE
-          - task_type="design", domain="architecture" -> OPEN_DESIGN
-        """
-        routing_map = {
-            ("generate", "video"): PluginType.EXECUTOR,
-            ("analyze", "law"): PluginType.GRAPHCODE,
-            ("design", "architecture"): PluginType.OPEN_DESIGN,
-            ("synthesize", "homesteading"): PluginType.EXECUTOR,
-        }
-        
-        return routing_map.get((task_type, domain))
-    
-    async def _invoke_plugin(
-        self,
-        task_id: str,
-        plugin_type: PluginType,
-        task_type: str,
-        input_payload: dict[str, Any],
-        domain_profile: DomainProfile,
-    ) -> None:
-        """Invoke a plugin via MCP JSON-RPC."""
-        plugin = self.plugin_registry.get_plugin(plugin_type)
-        if not plugin or not plugin.enabled:
-            logger.error(f"Plugin {plugin_type.value} not available")
-            return
-        
-        # Build RPC call
-        method = f"{plugin_type.value}.{task_type}"
-        params = {
-            "task_id": task_id,
-            "input": input_payload,
-            "domain": domain_profile["domain"],
-            "models": {
-                "primary": domain_profile["primary_model"],
-                "aux": domain_profile["aux_models"],
-            },
-        }
-        
-        # Call plugin
-        result = await self.plugin_registry.call_plugin(
-            plugin_type,
-            method,
-            params,
-            request_id=task_id,
-        )
-        
-        if result:
-            # Update task with result
-            task = self.active_tasks.get(task_id)
-            if task:
-                task["status"] = "running"
-                task["result_payload"] = result
-                await store_task_state(task)
-            logger.info(f"Plugin {plugin_type.value} produced result for task {task_id}")
-        else:
-            logger.error(f"Plugin {plugin_type.value} failed for task {task_id}")
 
 
 # Global orchestrator singleton
-_orchestrator: Optional[HermesOrchestrator] = None
+_orchestrator: Optional[ExecutorOrchestrator] = None
 
 
-def get_orchestrator() -> HermesOrchestrator:
+def get_orchestrator() -> ExecutorOrchestrator:
     """Get or create global orchestrator."""
     global _orchestrator
     if _orchestrator is None:
-        _orchestrator = HermesOrchestrator()
+        _orchestrator = ExecutorOrchestrator()
     return _orchestrator
