@@ -51,14 +51,22 @@ start_service() {
 rm -f "$LOGS_DIR/.pids"
 touch "$LOGS_DIR/.pids"
 
-# 1. OpenViking (1933)
+# 1. OpenViking (1933) — assumed already running as daemon
 echo "1️⃣  Knowledge Store"
-start_service "OpenViking" "1933" "openviking serve --port 1933"
+if curl -s http://localhost:1933 > /dev/null 2>&1; then
+    echo "✓ OpenViking (port 1933) — already running"
+else
+    echo "⚠ OpenViking not detected on 1933 (install with: brew install openviking or similar)"
+fi
 
-# 2. MLX-Serve (11234) — local inference backend
+# 2. MLX-Serve (11234) — local inference backend (optional, assumed installed separately)
 echo ""
 echo "2️⃣  Inference Engine"
-start_service "mlx-serve" "11234" "mlx-serve serve --port 11234 --model Qwen/Qwen2.5-7B-Instruct"
+if curl -s http://localhost:11234 > /dev/null 2>&1; then
+    echo "✓ MLX-Serve (port 11234) — already running"
+else
+    echo "⚠ MLX-Serve not detected on 11234 (optional, start separately if needed)"
+fi
 
 # 3. Project MCPs (parallel execution)
 echo ""
